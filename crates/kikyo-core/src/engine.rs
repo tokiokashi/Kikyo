@@ -2364,9 +2364,17 @@ fn append_keystroke_events(
             return;
         }
         KeySpec::DirectString(ref s) => {
-            // Hand off the complex IME handling logic to the hook (outside the lock).
-            // This avoids deadlock when calling IME APIs while holding the Engine lock.
-            events.push(InputEvent::DirectString(s.clone()));
+            // Empty DirectString cells (e.g. `""` in a layout) are conventionally
+            // used as a "block" marker for a physical key. Emitting an empty
+            // DirectString triggers IME-control side effects (composition commit,
+            // IME state notifications) on the hook side, which surprised users
+            // who only intended a no-op. Skip the event when the string is empty
+            // so the cell still blocks pass-through but stays a true no-op.
+            if !s.is_empty() {
+                // Hand off the complex IME handling logic to the hook (outside the lock).
+                // This avoids deadlock when calling IME APIs while holding the Engine lock.
+                events.push(InputEvent::DirectString(s.clone()));
+            }
             return;
         }
     };
