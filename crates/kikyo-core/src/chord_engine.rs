@@ -956,7 +956,12 @@ impl ChordEngine {
                             // an earlier oi iteration would stay in pending without
                             // its `tapped_out` flag set, and the next on_event call
                             // would re-emit the same KeyTap. (See test_repro_roll_*.)
-                            self.apply_used_marks_only(&mark_as_used, &mark_as_tapped);
+                            self.apply_pending_mutations(
+                                &consumed_indices,
+                                &flushed_indices,
+                                &mark_as_used,
+                                &mark_as_tapped,
+                            );
                             return output;
                         }
                         // In 2-key mode, keep waiting by default. However, if p1 is already
@@ -1063,7 +1068,12 @@ impl ChordEngine {
                             // Wait globally for 3-key resolution.
                             // BUGFIX: same partial cleanup as the ratio=None branch —
                             // propagate used/tapped marks only, don't remove pending entries.
-                            self.apply_used_marks_only(&mark_as_used, &mark_as_tapped);
+                            self.apply_pending_mutations(
+                                &consumed_indices,
+                                &flushed_indices,
+                                &mark_as_used,
+                                &mark_as_tapped,
+                            );
                             return output;
                         }
                     }
@@ -1120,19 +1130,25 @@ impl ChordEngine {
             }
         }
 
-        self.apply_pending_mutations(&consumed_indices, &flushed_indices, &mark_as_used);
+        self.apply_pending_mutations(
+            &consumed_indices,
+            &flushed_indices,
+            &mark_as_used,
+            &mark_as_tapped,
+        );
 
         output
     }
 
-    /// Apply marked mutations (consumed/flushed/used) to `self.state.pending`.
-    /// Called at the end of `check_chords` so that accumulated index marks
-    /// reach pending. Removes entries marked consumed or flushed.
+    /// Apply marked mutations (consumed/flushed/used/tapped) to `self.state.pending`.
+    /// Removes entries marked consumed or flushed and propagates used/tapped flags
+    /// into the surviving entries.
     fn apply_pending_mutations(
         &mut self,
         consumed_indices: &[bool],
         flushed_indices: &[bool],
         mark_as_used: &[bool],
+        mark_as_tapped: &[bool],
     ) {
         let has_consumed = consumed_indices.iter().any(|v| *v);
         let has_flushed = flushed_indices.iter().any(|v| *v);
@@ -1151,6 +1167,9 @@ impl ChordEngine {
                 if i < mark_as_used.len() && mark_as_used[i] {
                     p.used = true;
                 }
+                if i < mark_as_tapped.len() && mark_as_tapped[i] {
+                    p.tapped_out = true;
+                }
                 new_pending.push(p);
             }
             self.state.pending = new_pending;
@@ -1159,27 +1178,9 @@ impl ChordEngine {
                 if i < mark_as_used.len() && mark_as_used[i] {
                     p.used = true;
                 }
-            }
-        }
-    }
-
-    /// Apply only `mark_as_used` and `mark_as_tapped` flags to pending,
-    /// WITHOUT removing flushed/consumed entries. Called before early returns
-    /// inside `check_chords` where the higher layer (engine.rs) expects pending
-    /// structure to remain intact, but where we still need the `tapped_out`
-    /// flag set to prevent the same KeyTap being re-emitted on a subsequent
-    /// check_chords call.
-    fn apply_used_marks_only(
-        &mut self,
-        mark_as_used: &[bool],
-        mark_as_tapped: &[bool],
-    ) {
-        for (i, p) in self.state.pending.iter_mut().enumerate() {
-            if i < mark_as_used.len() && mark_as_used[i] {
-                p.used = true;
-            }
-            if i < mark_as_tapped.len() && mark_as_tapped[i] {
-                p.tapped_out = true;
+                if i < mark_as_tapped.len() && mark_as_tapped[i] {
+                    p.tapped_out = true;
+                }
             }
         }
     }
@@ -2479,5 +2480,56 @@ mod tests {
             !two_key_jk_chord,
             "Should not have produced a 2-key J+K chord (older-key would be suppressed by engine.rs)"
         );
+    }
+
+    #[test]
+    fn test_repro_naisu_roll_no_stuck_on_subsequent_keys() {
+        // Scenario reported by user: typing 「ないす」 (M K O on US row map of
+        // tokioka layout) at speed prints 「ない」 then any subsequent keypress
+        // emits 「す」 (the O keytap is "stuck" and re-fires).
+        //
+        // Internally: after ない rolls, M and K are flushed as KeyTap. With
+        // the previous partial-cleanup early return path, the flushed entries
+        // were never removed from `pending`, only flag-marked. The next O↓
+        // would therefore see stale ない pending entries, hit an extension_wait,
+        // early-return WITHOUT removing the flushed/consumed entries again,
+        // and leave O in pending unflushed. On the next key event, O's KeyTap
+        // re-fires.
+        //
+        // After the fix: apply_pending_mutations always removes flushed/consumed
+        // entries even on early returns.
+        let t0 = Instant::now();
+        let k_m = make_key(0x32); // な (US m)
+        let k_k = make_key(0x25); // い (US k)
+        let k_o = make_key(0x18); // す (US o)
+        let k_x = make_key(0x2D); // 続けて打つ任意キー (US x)
+        let mut profile = continuous_char_profile(0.5, &[]);
+        profile.max_chord_size = 3;
+        let mut engine = ChordEngine::new(profile);
+
+        let mut all = Vec::new();
+        // ない (rolling): M↓ K↓ M↑ K↑
+        all.extend(engine.on_event(make_event(k_m, KeyEdge::Down, t0)));
+        all.extend(engine.on_event(make_event(k_k, KeyEdge::Down, t0 + Duration::from_millis(20))));
+        all.extend(engine.on_event(make_event(k_m, KeyEdge::Up, t0 + Duration::from_millis(40))));
+        all.extend(engine.on_event(make_event(k_k, KeyEdge::Up, t0 + Duration::from_millis(60))));
+        // す
+        all.extend(engine.on_event(make_event(k_o, KeyEdge::Down, t0 + Duration::from_millis(100))));
+        all.extend(engine.on_event(make_event(k_o, KeyEdge::Up, t0 + Duration::from_millis(120))));
+        // 次の任意キー
+        all.extend(engine.on_event(make_event(k_x, KeyEdge::Down, t0 + Duration::from_millis(160))));
+        all.extend(engine.on_event(make_event(k_x, KeyEdge::Up, t0 + Duration::from_millis(180))));
+
+        eprintln!("[NAISU+X] decisions: {:#?}", all);
+        let taps = collect_keytaps(&all);
+        let o_count = taps.iter().filter(|k| **k == k_o).count();
+        let x_count = taps.iter().filter(|k| **k == k_x).count();
+        eprintln!("[NAISU+X] taps: o={}, x={}", o_count, x_count);
+        // ない is emitted as either Chord([M,K]) (which engine.rs unfolds into
+        // per-key KeyTaps) or as direct KeyTaps — either is fine for chord_engine
+        // alone. The regression we are guarding against is O sticking in pending
+        // and re-firing on subsequent keys.
+        assert_eq!(o_count, 1, "O (す) should be tapped exactly once (regression: was sticking after multi-key roll)");
+        assert_eq!(x_count, 1, "X (次のキー) should be tapped exactly once (regression: stale O was firing)");
     }
 }
