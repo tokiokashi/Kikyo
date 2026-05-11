@@ -808,21 +808,42 @@ impl ChordEngine {
                         let valid_pairwise = r12.unwrap() >= self.profile.char_key_overlap_ratio
                             && r23.unwrap() >= self.profile.char_key_overlap_ratio
                             && r13.unwrap() >= self.profile.char_key_overlap_ratio;
-                        // BUGFIX: detect "all three keys held simultaneously at some point"
-                        // (pending is sorted by t_down so p1.t_down <= p2.t_down <= p3.t_down,
-                        // so we just need p1 and p2 to still be held at p3.t_down).
-                        // This makes 3-key all-down-then-all-up patterns get treated as a
-                        // chord candidate (which engine.rs then resolves; if undefined, it
-                        // falls back to emitting each constituent key as a sequential KeyTap).
-                        // Without this, a roll like "J↓ K↓ L↓ J↑ K↑ L↑" where t-spans barely
-                        // overlap pairwise would fail r13, drop to 2-key chord J+K, and then
-                        // engine.rs's continuous-shift older-key suppression would eat the
-                        // older key's intended single output.
+                        // Hybrid fallback for the "all three held at some point" pattern:
+                        //   - Binary check captures intent of "press 3 keys together" even
+                        //     when pairwise overlap ratios drop (e.g. brief simultaneous taps,
+                        //     "J↓ K↓ L↓ J↑ K↑ L↑").
+                        //   - BUT this alone over-fires for continuous-shift + roll patterns
+                        //     (Issue #1: J held throughout while K and E roll briefly — at the
+                        //     moment of E↓, both J and K are still pressed, so the binary
+                        //     check fires でぃ when the user wanted ので).
+                        //
+                        // So: only allow the binary fallback when the three keys' hold
+                        // durations are roughly symmetric. When asymmetric (one key acts as
+                        // continuous shift), require strict pairwise overlap, which lets
+                        // r23 (the rolling pair) correctly disqualify the chord.
+                        let p1_end = p1.t_up.unwrap_or(now);
+                        let p2_end = p2.t_up.unwrap_or(now);
+                        let p3_end = p3.t_up.unwrap_or(now);
+                        let p1_dur = p1_end.saturating_duration_since(p1.t_down);
+                        let p2_dur = p2_end.saturating_duration_since(p2.t_down);
+                        let p3_dur = p3_end.saturating_duration_since(p3.t_down);
+                        let min_dur = p1_dur.min(p2_dur).min(p3_dur);
+                        let max_dur = p1_dur.max(p2_dur).max(p3_dur);
+                        let symmetric_holds = if max_dur > Duration::ZERO {
+                            min_dur.as_secs_f64() / max_dur.as_secs_f64()
+                                >= self.profile.char_key_overlap_ratio
+                        } else {
+                            false
+                        };
                         let all_three_held_at_some_point = p1
                             .t_up
                             .map_or(true, |t| t > p3.t_down)
                             && p2.t_up.map_or(true, |t| t > p3.t_down);
-                        let valid = valid_pairwise || all_three_held_at_some_point;
+                        let valid = if symmetric_holds {
+                            valid_pairwise || all_three_held_at_some_point
+                        } else {
+                            valid_pairwise
+                        };
                         let has_modifier = self.modifier_kind(p1.key).is_modifier()
                             || self.modifier_kind(p2.key).is_modifier()
                             || self.modifier_kind(p3.key).is_modifier();
