@@ -71,7 +71,7 @@
 - 文字修飾キー（`trigger_keys`）を連続修飾として扱う
 - ロールオーバー時に旧キーの誤出力を防ぐため以下を実装
   - 同一キー再押下時の旧 pending グループ先行 flush
-  - 短すぎる重なり（`ROLLOVER_CHAIN_GUARD_OVERLAP_MS = 12ms`）の誤和音ガード
+  - 短すぎる重なり（`ROLLOVER_CHAIN_GUARD_OVERLAP_MS = 5ms`）の誤和音ガード
   - 未定義和音時の後段キー優先フォールバック
 
 ## 7. 単打鍵挙動
