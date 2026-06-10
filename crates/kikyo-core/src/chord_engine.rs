@@ -2687,4 +2687,165 @@ mod tests {
             "X (subsequent key) should be tapped exactly once (regression: stale O was firing)"
         );
     }
+
+    /// Regression for: an older non-chord pending key gets emitted AFTER the
+    /// newer chord output instead of before.
+    ///
+    /// Setup mirrors the user-reported case: `s` (a target key whose base
+    /// plane is a plain passthrough) is pressed first, then `i+a+o` are
+    /// pressed together and a 3-key chord eventually forms over the
+    /// `i+a+o` triple. `s` is released before the chord triple resolves,
+    /// so when the chord is finally locked in there is a lonely `s`
+    /// sitting in `pending` that should be flushed as a `KeyTap` before
+    /// the chord — `s` was pressed first, so its output must appear first.
+    ///
+    /// Buggy ordering: `[Chord([i,a,o]), KeyTap(s)]`
+    /// Expected ordering: `[KeyTap(s), Chord([i,a,o])]`
+    #[test]
+    fn test_older_lonely_tap_emitted_before_later_chord() {
+        let mut profile = Profile::default();
+        profile.max_chord_size = 3;
+        profile.char_key_continuous = true;
+        profile.char_key_overlap_ratio = 0.84;
+
+        let k_s = make_key(0x1F); // S
+        let k_i = make_key(0x17); // I
+        let k_a = make_key(0x1E); // A
+        let k_o = make_key(0x18); // O
+
+        // Restrict target_keys to the four keys involved so other scan
+        // codes are irrelevant.
+        let mut targets = HashSet::new();
+        targets.insert(k_s);
+        targets.insert(k_i);
+        targets.insert(k_a);
+        targets.insert(k_o);
+        profile.target_keys = Some(targets);
+
+        // `i` and `a` are sub-plane trigger keys in the user's layout
+        // (`<i>`, `<a>`, `<i><a>`); the engine treats trigger keys as
+        // continuous char-shift modifiers under `char_key_continuous`.
+        profile.trigger_keys.insert(k_i, "<i>".to_string());
+        profile.trigger_keys.insert(k_a, "<a>".to_string());
+        profile.trigger_keys.insert(k_o, "<o>".to_string());
+
+        let mut engine = ChordEngine::new(profile);
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+
+        // Timings chosen so that:
+        // - (s,*) pairs are far below the 0.84 ratio threshold (s released
+        //   well before i/a/o so any overlap is short relative to the
+        //   longer i/a/o hold). Therefore no chord involves s.
+        // - (i,a,o) overlaps are ~1.0 — tight cluster of downs followed by
+        //   tight cluster of ups, so the 3-key chord locks in.
+        let mut decisions: Vec<Decision> = Vec::new();
+        decisions.extend(engine.on_event(make_event(k_s, KeyEdge::Down, t0)));
+        decisions.extend(engine.on_event(make_event(k_i, KeyEdge::Down, t0 + ms(10))));
+        decisions.extend(engine.on_event(make_event(k_a, KeyEdge::Down, t0 + ms(11))));
+        decisions.extend(engine.on_event(make_event(k_o, KeyEdge::Down, t0 + ms(12))));
+        decisions.extend(engine.on_event(make_event(k_s, KeyEdge::Up, t0 + ms(30))));
+        decisions.extend(engine.on_event(make_event(k_i, KeyEdge::Up, t0 + ms(50))));
+        decisions.extend(engine.on_event(make_event(k_a, KeyEdge::Up, t0 + ms(51))));
+        decisions.extend(engine.on_event(make_event(k_o, KeyEdge::Up, t0 + ms(52))));
+
+        // Find the positions of the s KeyTap and the chord output.
+        let s_tap_pos = decisions
+            .iter()
+            .position(|d| matches!(d, Decision::KeyTap(k) if *k == k_s));
+        let chord_pos = decisions.iter().position(|d| {
+            matches!(d, Decision::Chord(keys)
+                if keys.contains(&k_i) && keys.contains(&k_a) && keys.contains(&k_o))
+        });
+
+        let s_pos = s_tap_pos
+            .unwrap_or_else(|| panic!("Expected KeyTap(s) in decisions, got {:?}", decisions));
+        let c_pos = chord_pos
+            .unwrap_or_else(|| panic!("Expected Chord([i,a,o]) in decisions, got {:?}", decisions));
+
+        assert!(
+            s_pos < c_pos,
+            "KeyTap(s) must precede Chord([i,a,o]) because s was pressed first; \
+             got s at {} and chord at {} in {:?}",
+            s_pos, c_pos, decisions
+        );
+        eprintln!("[test_older_lonely_tap_emitted_before_later_chord] decisions: {:?}", decisions);
+    }
+
+    /// Same scenario as the previous test but with timings tight enough
+    /// that `s` ends up included in a 3-key chord triple. With
+    /// `char_key_continuous=true` chord_engine emits a `Chord([s,i,a])`
+    /// even though no token is mapped for that triple — engine.rs then
+    /// has to split it. Use this case to see whether the chord_engine
+    /// level still preserves chronological output ordering vs s being
+    /// emitted last.
+    #[test]
+    fn test_older_key_tightly_overlapping_chord_triple() {
+        let mut profile = Profile::default();
+        profile.max_chord_size = 3;
+        profile.char_key_continuous = true;
+        profile.char_key_overlap_ratio = 0.84;
+
+        let k_s = make_key(0x1F); // S
+        let k_i = make_key(0x17); // I
+        let k_a = make_key(0x1E); // A
+        let k_o = make_key(0x18); // O
+
+        let mut targets = HashSet::new();
+        targets.insert(k_s);
+        targets.insert(k_i);
+        targets.insert(k_a);
+        targets.insert(k_o);
+        profile.target_keys = Some(targets);
+        profile.trigger_keys.insert(k_i, "<i>".to_string());
+        profile.trigger_keys.insert(k_a, "<a>".to_string());
+        profile.trigger_keys.insert(k_o, "<o>".to_string());
+
+        let mut engine = ChordEngine::new(profile);
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+
+        // Tight clustering: every key is held ~40ms, s released earliest,
+        // chord triple released last. (s,i) pair ratio = (45-5)/(50-5)=0.89
+        // — above 0.84, so chord_engine may bundle s into the 3-key chord.
+        let mut decisions: Vec<Decision> = Vec::new();
+        decisions.extend(engine.on_event(make_event(k_s, KeyEdge::Down, t0)));
+        decisions.extend(engine.on_event(make_event(k_i, KeyEdge::Down, t0 + ms(5))));
+        decisions.extend(engine.on_event(make_event(k_a, KeyEdge::Down, t0 + ms(6))));
+        decisions.extend(engine.on_event(make_event(k_o, KeyEdge::Down, t0 + ms(7))));
+        decisions.extend(engine.on_event(make_event(k_s, KeyEdge::Up, t0 + ms(45))));
+        decisions.extend(engine.on_event(make_event(k_i, KeyEdge::Up, t0 + ms(50))));
+        decisions.extend(engine.on_event(make_event(k_a, KeyEdge::Up, t0 + ms(51))));
+        decisions.extend(engine.on_event(make_event(k_o, KeyEdge::Up, t0 + ms(52))));
+
+        eprintln!("[test_older_key_tightly_overlapping_chord_triple] decisions: {:?}", decisions);
+
+        // We only assert chronology: any KeyTap(s) or chord containing s
+        // must come before any chord made up of only [i,a,o]. The exact
+        // shape is whatever the engine decides.
+        let iao_chord_pos = decisions.iter().position(|d| match d {
+            Decision::Chord(keys) => {
+                keys.len() == 3
+                    && keys.contains(&k_i)
+                    && keys.contains(&k_a)
+                    && keys.contains(&k_o)
+                    && !keys.contains(&k_s)
+            }
+            _ => false,
+        });
+
+        let s_output_pos = decisions.iter().position(|d| match d {
+            Decision::KeyTap(k) => *k == k_s,
+            Decision::Chord(keys) => keys.contains(&k_s),
+            _ => false,
+        });
+
+        if let (Some(s_pos), Some(c_pos)) = (s_output_pos, iao_chord_pos) {
+            assert!(
+                s_pos < c_pos,
+                "s output (idx {}) must precede [i,a,o] chord (idx {}); decisions: {:?}",
+                s_pos, c_pos, decisions
+            );
+        }
+    }
 }
