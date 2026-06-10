@@ -431,7 +431,7 @@ pub struct ChordEngine {
 }
 
 impl ChordEngine {
-    const ROLLOVER_CHAIN_GUARD_OVERLAP_MS: u64 = 12;
+    const ROLLOVER_CHAIN_GUARD_OVERLAP_MS: u64 = 5;
 
     pub fn new(profile: Profile) -> Self {
         Self {
@@ -1881,18 +1881,18 @@ mod tests {
             .on_event(make_event(k_f, KeyEdge::Down, t0))
             .is_empty());
         assert!(engine
-            .on_event(make_event(k_k, KeyEdge::Up, t0 + Duration::from_millis(5)))
+            .on_event(make_event(k_k, KeyEdge::Up, t0 + Duration::from_millis(3)))
             .is_empty());
         assert!(engine
             .on_event(make_event(
                 k_s,
                 KeyEdge::Down,
-                t0 + Duration::from_millis(5)
+                t0 + Duration::from_millis(3)
             ))
             .is_empty());
 
         // Without rollover-chain guard this became Chord(K,F).
-        let res = engine.on_event(make_event(k_f, KeyEdge::Up, t0 + Duration::from_millis(10)));
+        let res = engine.on_event(make_event(k_f, KeyEdge::Up, t0 + Duration::from_millis(8)));
         assert_eq!(res, vec![Decision::KeyTap(k_k)]);
     }
 
