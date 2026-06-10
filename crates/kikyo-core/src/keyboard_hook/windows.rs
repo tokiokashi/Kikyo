@@ -20,6 +20,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT_0,
     INPUT_KEYBOARD,
     KEYBDINPUT,
+    KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP,
     KEYEVENTF_SCANCODE,
@@ -1095,10 +1096,46 @@ fn watchdog_loop() {
     }
 }
 
+/// Japanese IME control keys (PS/2 set 1 scancode → Win32 VK).
+///
+/// Plain scancode injection (`KEYEVENTF_SCANCODE` only) requires the active
+/// Windows keyboard layout to map the scancode to a VK. When the user runs a
+/// non-JIS layout (e.g. US101) the scancode → VK lookup yields nothing for
+/// JIS-specific keys, so the IME never sees the event. Pre-resolving the VK
+/// and injecting it alongside the scancode (without the SCANCODE flag) makes
+/// IME-layer consumers receive the event regardless of layout.
+///
+/// Covered keys:
+/// - `0x70`: カタカナ/ひらがな (USB HID KANA) → `VK_DBE_HIRAGANA` (0xF2)
+/// - `0x79`: 変換 (Henkan) → `VK_CONVERT` (0x1C)
+/// - `0x7B`: 無変換 (Muhenkan) → `VK_NONCONVERT` (0x1D)
+fn japanese_ime_key_vk(sc: u16, ext: bool) -> Option<u16> {
+    if ext {
+        return None;
+    }
+    match sc {
+        0x70 => Some(0x00F2), // VK_DBE_HIRAGANA
+        0x79 => Some(0x001C), // VK_CONVERT
+        0x7B => Some(0x001D), // VK_NONCONVERT
+        _ => None,
+    }
+}
+
 /// Inject a key event (scancode).
 /// up: true for KeyUp, false for KeyDown.
+///
+/// For Japanese IME control keys (see [`japanese_ime_key_vk`]) the VK is
+/// resolved up-front and injected alongside the scancode without the
+/// `KEYEVENTF_SCANCODE` flag, so receivers downstream of the hook see a
+/// fully-populated event even when the OS keyboard layout cannot derive the
+/// VK from the scancode alone.
 pub fn inject_scancode(sc: u16, ext: bool, up: bool) -> anyhow::Result<()> {
-    let mut flags = KEYEVENTF_SCANCODE;
+    let vk = japanese_ime_key_vk(sc, ext).unwrap_or(0);
+    let mut flags = if vk != 0 {
+        KEYBD_EVENT_FLAGS(0)
+    } else {
+        KEYEVENTF_SCANCODE
+    };
     if ext {
         flags |= KEYEVENTF_EXTENDEDKEY;
     }
@@ -1110,7 +1147,7 @@ pub fn inject_scancode(sc: u16, ext: bool, up: bool) -> anyhow::Result<()> {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
-                wVk: VIRTUAL_KEY(0),
+                wVk: VIRTUAL_KEY(vk),
                 wScan: sc,
                 dwFlags: flags,
                 time: 0,
